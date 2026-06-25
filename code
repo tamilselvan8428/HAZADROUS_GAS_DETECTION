@@ -1,19 +1,36 @@
 #include <WiFi.h>
 #include <WebServer.h>
+#include <HTTPClient.h>
 
+// WiFi Settings
 const char* ssid = "OPPO A17k";
 const char* password = "123456789";
+const unsigned long wifiTimeoutMs = 15000; // 15 seconds connection timeout
 
-const int mq6Pin = 34;
-const int mq135Pin = 35;
-const int ledPin = 32; // Define the LED pin
+// ThingSpeak Configuration
+const char* thingSpeakWriteKey = "4EI9Q0S41ARSD9Q5";
+const char* thingSpeakUrl = "http://api.thingspeak.com/update";
+const unsigned long thingSpeakInterval = 15000; // 15 seconds rate limit
+
+// Pin Definitions
+const int mq6Pin = 34;    // MQ-6 Sensor pin
+const int mq135Pin = 35;  // MQ-135 Sensor pin
+const int ledPin = 32;    // Define the LED pin
 
 WebServer server(80);
 
+// Timing and State
 unsigned long previousMillis = 0;
-const long interval = 500;  
-String sensorData = "";
+unsigned long lastThingSpeakMillis = 0;
+const long interval = 1000; // Read sensors every 1 second
 
+// Global Sensor Values
+float methanePPM = 0.0;
+float ammoniaPPM = 0.0;
+bool isDangerous = false;
+String safetyStatus = "Initializing...";
+
+// Calibration Parameters
 const float methane_slope = 4;  
 const float methane_intercept = 10;
 const float ammonia_slope = 0.01;   
@@ -27,25 +44,34 @@ void setup() {
   Serial.begin(115200);
   delay(100);
 
+  // Set pin modes
+  pinMode(mq6Pin, INPUT);
+  pinMode(mq135Pin, INPUT);
+  pinMode(ledPin, OUTPUT);
+  digitalWrite(ledPin, LOW); // Start with LED off
+
+  // Start connecting to WiFi (non-blocking style initialization)
   Serial.print("Connecting to ");
   Serial.println(ssid);
   WiFi.begin(ssid, password);
 
-  while (WiFi.status() != WL_CONNECTED) {
+  unsigned long startAttemptTime = millis();
+  while (WiFi.status() != WL_CONNECTED && millis() - startAttemptTime < wifiTimeoutMs) {
     delay(500);
     Serial.print(".");
   }
 
-  Serial.println();
-  Serial.println("WiFi connected.");
-  Serial.print("IP address: ");
-  Serial.println(WiFi.localIP());
+  if (WiFi.status() == WL_CONNECTED) {
+    Serial.println();
+    Serial.println("WiFi connected.");
+    Serial.print("IP address: ");
+    Serial.println(WiFi.localIP());
+  } else {
+    Serial.println();
+    Serial.println("WiFi connection timed out. Starting system in standalone/offline mode.");
+  }
 
-  
-  pinMode(mq6Pin, INPUT);
-  pinMode(mq135Pin, INPUT);
-  pinMode(ledPin, OUTPUT); // Set the LED pin as output
-
+  // Set up local server routing
   server.on("/", handleRoot);
   server.on("/data", handleData);
 
@@ -57,32 +83,57 @@ void loop() {
   server.handleClient();
 
   unsigned long currentMillis = millis();
+
+  // Periodically read sensor and perform safety actions locally (Every 1 second)
   if (currentMillis - previousMillis >= interval) {
     previousMillis = currentMillis;
  
     int methaneRaw = analogRead(mq6Pin);
     int ammoniaRaw = analogRead(mq135Pin);
     
-    float methanePPM = analogToPPM(methaneRaw, methane_slope, methane_intercept);
-    float ammoniaPPM = analogToPPM(ammoniaRaw, ammonia_slope, ammonia_intercept);
+    methanePPM = analogToPPM(methaneRaw, methane_slope, methane_intercept);
+    ammoniaPPM = analogToPPM(ammoniaRaw, ammonia_slope, ammonia_intercept);
 
-    bool isMethaneHigh = methanePPM > 1000;
-    bool isAmmoniaHigh = ammoniaPPM > 300;
-    String status = (isMethaneHigh || isAmmoniaHigh) ? "Danger: High gas levels detected!" : "Gas levels are normal.";
+    isDangerous = (methanePPM > 1000) || (ammoniaPPM > 300);
+    safetyStatus = isDangerous ? "Danger: High gas levels detected!" : "Gas levels are normal.";
     
-    if (isMethaneHigh || isAmmoniaHigh) {
+    if (isDangerous) {
       digitalWrite(ledPin, HIGH);
     } else {
       digitalWrite(ledPin, LOW);
     }
+  }
 
-    sensorData = "Methane level: " + String(methanePPM) + " ppm\n";
-    sensorData += "Ammonia level: " + String(ammoniaPPM) + " ppm\n";
-    sensorData += status;
+  // Periodically upload data to ThingSpeak (Every 15 seconds)
+  if (currentMillis - lastThingSpeakMillis >= thingSpeakInterval) {
+    lastThingSpeakMillis = currentMillis;
+
+    if (WiFi.status() == WL_CONNECTED) {
+      HTTPClient http;
+      String url = String(thingSpeakUrl) + "?api_key=" + String(thingSpeakWriteKey) +
+                   "&field1=" + String(methanePPM) +
+                   "&field2=" + String(ammoniaPPM) +
+                   "&field3=" + String(isDangerous ? 1 : 0);
+      
+      http.begin(url);
+      int httpResponseCode = http.GET();
+      
+      if (httpResponseCode > 0) {
+        Serial.print("ThingSpeak Update Successful. HTTP Response code: ");
+        Serial.println(httpResponseCode);
+      } else {
+        Serial.print("Error on sending GET request to ThingSpeak: ");
+        Serial.println(httpResponseCode);
+      }
+      http.end();
+    } else {
+      Serial.println("WiFi offline. Skipping ThingSpeak upload.");
+    }
   }
 }
 
 void handleRoot() {
+  // Web GUI Dashboard
   String htmlContent = "<html><head><title>Gas Level Sensor</title>";
   htmlContent += "<style>";
   htmlContent += "body {";
@@ -103,9 +154,6 @@ void handleRoot() {
   htmlContent += "        document.getElementById('methane').innerText = data.methane;";
   htmlContent += "        document.getElementById('ammonia').innerText = data.ammonia;";
   htmlContent += "        document.getElementById('status').innerText = data.status;";
-  htmlContent += "        if (data.isDangerous) {";
-  htmlContent += "            alert(data.status);";
-  htmlContent += "        }";
   htmlContent += "    });";
   htmlContent += "}";
   htmlContent += "setInterval(fetchData, 1000);"; 
@@ -137,21 +185,10 @@ void handleRoot() {
 }
 
 void handleData() {
-  int methaneRaw = analogRead(mq6Pin);
-  int ammoniaRaw = analogRead(mq135Pin);
-
-  float methanePPM = analogToPPM(methaneRaw, methane_slope, methane_intercept);
-  float ammoniaPPM = analogToPPM(ammoniaRaw, ammonia_slope, ammonia_intercept);
-
-  bool isMethaneHigh = methanePPM > 1000;
-  bool isAmmoniaHigh = ammoniaPPM > 300;
-  bool isDangerous = isMethaneHigh || isAmmoniaHigh;
-  String status = isDangerous ? "Danger: High gas levels detected!" : "Gas levels are normal.";
-
   String jsonData = "{";
   jsonData += "\"methane\": " + String(methanePPM) + ",";
   jsonData += "\"ammonia\": " + String(ammoniaPPM) + ",";
-  jsonData += "\"status\": \"" + status + "\",";
+  jsonData += "\"status\": \"" + safetyStatus + "\",";
   jsonData += "\"isDangerous\": " + String(isDangerous ? "true" : "false");
   jsonData += "}";
 
